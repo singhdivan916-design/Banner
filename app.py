@@ -81,7 +81,6 @@ def is_cherokee(char):
     return (0x13A0 <= code <= 0x13FF) or (0xAB70 <= code <= 0xABBF)
 
 def measure_mixed_text(draw, text, size):
-    """Measure total width of a string that may contain Cherokee characters."""
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
     total_width = 0
@@ -91,18 +90,17 @@ def measure_mixed_text(draw, text, size):
     return total_width
 
 def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shadow_color='black', fill='white'):
-    """Draw text with a drop shadow."""
     x, y = xy
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
-    # Draw shadow
+    # Shadow
     sx, sy = shadow_offset
     current_x = x + sx
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y + sy), char, font=font, fill=shadow_color)
         current_x += font.getlength(char)
-    # Draw main text
+    # Main text
     current_x = x
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
@@ -112,74 +110,103 @@ def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shad
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
         CANVAS_W, CANVAS_H = 2048, 512
-        AVATAR_SIZE = 512
-        BORDER = 14
+        AVATAR_SIZE = 512          # final avatar canvas size
+        AVATAR_MARGIN = 40         # minimum margin from edges
 
+        # ----- Process Avatar -----
         avatar_img = bytes_to_image(avatar_bytes)
+        # Determine fit size within AVATAR_SIZE - 2*AVATAR_MARGIN
+        max_fit = AVATAR_SIZE - 2 * AVATAR_MARGIN  # 432
+        w, h = avatar_img.size
+        # Scale to fit within max_fit x max_fit while preserving aspect
+        scale = min(max_fit / w, max_fit / h, 1.0)  # do not upscale if smaller?
+        # But we want at least 40px margin, so we may need to upscale if original is smaller? 
+        # The instruction: "Whatever you put inside, keep it at least 40px away from all 4 edges."
+        # So we should ensure the image is scaled to fit within the 432x432 box, but if it's smaller, we can leave it as is? 
+        # We'll scale to fit, but not upscale beyond original size (so we don't blur) – we'll keep original if smaller.
+        if w < max_fit and h < max_fit:
+            new_w, new_h = w, h
+        else:
+            scale = min(max_fit / w, max_fit / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+        avatar_resized = avatar_img.resize((new_w, new_h), Image.LANCZOS)
+        # Create 512x512 transparent canvas
+        avatar_canvas = Image.new("RGBA", (AVATAR_SIZE, AVATAR_SIZE), (0, 0, 0, 0))
+        # Paste centered
+        paste_x = (AVATAR_SIZE - new_w) // 2
+        paste_y = (AVATAR_SIZE - new_h) // 2
+        avatar_canvas.paste(avatar_resized, (paste_x, paste_y), avatar_resized)
+        # Now avatar_canvas is the processed avatar
+
+        # ----- Process Banner -----
         banner_img = bytes_to_image(banner_bytes)
-        pin_img = bytes_to_image(pin_bytes)
-
-        level = str(data.get("AccountLevel", "Not Found"))
-        nickname = data.get("AccountName", "Not Found")
-        guild_name = data.get("GuildName", "Not Found")
-
-        # Avatar with border
-        avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
-        bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
-        bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
-
-        # Banner processing
-        b_w, b_h = banner_img.size
-        if b_w > 50 and b_h > 50:
-            banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
-            b_w, b_h = banner_img.size
-            crop_top, crop_bottom, crop_sides = 0.23, 0.32, 0.17
-            left, top = b_w * crop_sides, b_h * crop_top
-            right, bottom = b_w * (1 - crop_sides), b_h * (1 - crop_bottom)
-            banner_img = banner_img.crop((left, top, right, bottom))
-
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
-        b_w, b_h = banner_img.size
+        # Crop: left 200, top 32, right 32, bottom 32
+        w, h = banner_img.size
+        left = 200
+        top = 32
+        right = w - 32
+        bottom = h - 32
+        # Ensure crop is valid
+        if right > left and bottom > top:
+            banner_cropped = banner_img.crop((left, top, right, bottom))
+        else:
+            # Fallback: use original
+            banner_cropped = banner_img
+        # Now scale banner to fill the remaining width (CANVAS_W - AVATAR_SIZE) at height CANVAS_H
+        target_banner_w = CANVAS_W - AVATAR_SIZE  # 1536
+        b_w, b_h = banner_cropped.size
         if b_h > 0:
+            # Scale to height = CANVAS_H
             scale = CANVAS_H / b_h
             new_banner_w = int(b_w * scale)
+            # If width < target, scale to width (and crop height later? but we want to fill)
             if new_banner_w < target_banner_w:
+                # scale to width, then crop height to CANVAS_H
                 scale = target_banner_w / b_w
                 new_banner_h = int(b_h * scale)
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
+                banner_scaled = banner_cropped.resize((target_banner_w, new_banner_h), Image.LANCZOS)
+                # Crop height to CANVAS_H (center)
+                b_w, b_h = banner_scaled.size
+                if b_h > CANVAS_H:
+                    top_crop = (b_h - CANVAS_H) // 2
+                    banner_scaled = banner_scaled.crop((0, top_crop, b_w, top_crop + CANVAS_H))
+                else:
+                    # if still smaller, pad? but we want to fill exactly, so we resize to target
+                    banner_scaled = banner_scaled.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
             else:
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            b_w, b_h = banner_img.size
-            if b_w > target_banner_w:
-                left = (b_w - target_banner_w) // 2
-                right = left + target_banner_w
-                banner_img = banner_img.crop((left, 0, right, CANVAS_H))
-            else:
-                banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
+                # scale to height, then crop width if needed
+                banner_scaled = banner_cropped.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
+                b_w, b_h = banner_scaled.size
+                if b_w > target_banner_w:
+                    left_crop = (b_w - target_banner_w) // 2
+                    banner_scaled = banner_scaled.crop((left_crop, 0, left_crop + target_banner_w, CANVAS_H))
+                else:
+                    # stretch to target
+                    banner_scaled = banner_scaled.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
         else:
-            banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
+            banner_scaled = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
 
-        # Combine
+        # ----- Combine -----
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-        combined.paste(bordered_avatar, (0, 0), bordered_avatar)
-        combined.paste(banner_img, (AVATAR_SIZE + 2 * BORDER, 0))
+        combined.paste(avatar_canvas, (0, 0), avatar_canvas)
+        combined.paste(banner_scaled, (AVATAR_SIZE, 0), banner_scaled)
 
         draw = ImageDraw.Draw(combined)
 
-        # ----- Text drawing (shadow style) -----
+        # ----- Text with shadow -----
+        nickname = data.get("AccountName", "Not Found")
+        guild_name = data.get("GuildName", "Not Found")
+        level = str(data.get("AccountLevel", "Not Found"))
+
         name_size = 84
         guild_size = 84
         level_size = 78
 
-        text_x = AVATAR_SIZE + 2 * BORDER + 58  # avatar box width + border + offset
-
-        # Draw nickname
+        text_x = AVATAR_SIZE + 58  # offset from left of banner
         draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size, shadow_offset=(3, 3))
-
-        # Draw guild name
         draw_mixed_text_with_shadow(draw, (text_x, 330), guild_name, guild_size, shadow_offset=(3, 3))
 
-        # Draw level (right‑bottom aligned)
         level_text = f"Lvl. {level}"
         lw = measure_mixed_text(draw, level_text, level_size)
         level_x = CANVAS_W - lw - 50
@@ -187,10 +214,12 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         draw_mixed_text_with_shadow(draw, (level_x, level_y), level_text, level_size, shadow_offset=(3, 3))
 
         # ----- Pin badge (lower left) -----
-        if pin_img and pin_img.size != (100, 100):
-            pin_size = 160
-            pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
-            combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
+        if pin_bytes:
+            pin_img = bytes_to_image(pin_bytes)
+            if pin_img and pin_img.size != (100, 100):
+                pin_size = 160
+                pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
+                combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
 
         img_io = io.BytesIO()
         combined.save(img_io, 'PNG')
