@@ -28,7 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-INFO_API_URL = "https://info.killersharmabot.online/player-info"
+# New info API endpoint
+INFO_API_URL = "http://187.127.175.208:5000/Bmw"
 FONT_FILE = "arial_unicode_bold.otf"
 FONT_CHEROKEE = "NotoSansCherokee.ttf"
 
@@ -50,7 +51,7 @@ def load_unicode_font(size, font_file=FONT_FILE):
         return ImageFont.load_default()
 
 async def fetch_image_bytes(item_id):
-    """Fetch an image from the new CDN repository."""
+    """Fetch an image from the CDN repository."""
     if not item_id or str(item_id) in ("0", "None"):
         return None
 
@@ -82,7 +83,6 @@ def bytes_to_image(img_bytes):
 
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
-        # New canvas dimensions
         CANVAS_W, CANVAS_H = 2048, 512
         AVATAR_SIZE = 512
         BORDER = 14
@@ -95,14 +95,12 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         name = data.get("AccountName", "Not Found")
         guild = data.get("GuildName", "Not Found")
 
-        # ----- Avatar (with border) -----
+        # Avatar with border
         avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
-
-        # Create a bordered avatar
         bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner -----
+        # Banner processing
         b_w, b_h = banner_img.size
         if b_w > 50 and b_h > 50:
             banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
@@ -112,42 +110,35 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
             right, bottom = b_w * (1 - crop_sides), b_h * (1 - crop_bottom)
             banner_img = banner_img.crop((left, top, right, bottom))
 
-        # Resize banner to fill the remaining width, maintaining aspect ratio
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER  # exactly 1536
+        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
         b_w, b_h = banner_img.size
         if b_h > 0:
-            # Scale to height = CANVAS_H
             scale = CANVAS_H / b_h
             new_banner_w = int(b_w * scale)
-            # If width is less than target, we need to zoom in (scale by width)
             if new_banner_w < target_banner_w:
                 scale = target_banner_w / b_w
                 new_banner_h = int(b_h * scale)
-                # but we want height to be at least CANVAS_H, so we may crop vertically later
-                # Simpler: resize to height = CANVAS_H, then crop horizontally
                 banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
             else:
                 banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            # Crop horizontally to target width
             b_w, b_h = banner_img.size
             if b_w > target_banner_w:
                 left = (b_w - target_banner_w) // 2
                 right = left + target_banner_w
                 banner_img = banner_img.crop((left, 0, right, CANVAS_H))
             else:
-                # Stretch to fill exactly
                 banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
         else:
             banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
 
-        # ----- Combine -----
+        # Combine
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
         combined.paste(bordered_avatar, (0, 0), bordered_avatar)
         combined.paste(banner_img, (AVATAR_SIZE + 2 * BORDER, 0))
 
         draw = ImageDraw.Draw(combined)
 
-        # ----- Fonts (scaled for new canvas) -----
+        # Fonts
         font_large = load_unicode_font(160)
         font_large_cherokee = load_unicode_font(160, FONT_CHEROKEE)
         font_small = load_unicode_font(122)
@@ -165,11 +156,9 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
             current_x = x
             for char in text:
                 font = font_fallback if is_cherokee(char) else font_main
-                # stroke
                 for dx in range(-size, size + 1):
                     for dy in range(-size, size + 1):
                         draw.text((current_x + dx, y + dy), char, font=font, fill=stroke_col)
-                # main text
                 draw.text((current_x, y), char, font=font, fill=text_col)
                 char_width = font.getlength(char)
                 current_x += char_width
@@ -178,13 +167,13 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         draw_text_with_stroke(text_x, text_y, name, font_large, font_large_cherokee, 4)
         draw_text_with_stroke(text_x, text_y + 240, guild, font_small, font_small_cherokee, 3)
 
-        # ----- Pin (badge) -----
+        # Pin badge
         if pin_img and pin_img.size != (100, 100):
             pin_size = 160
             pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
             combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
 
-        # ----- Level Box (bottom right) -----
+        # Level box
         level_txt = f"Lvl.{level}"
         try:
             bbox = draw.textbbox((0, 0), level_txt, font=font_level)
@@ -205,7 +194,6 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
 
     except Exception as e:
         logger.error(f"Error in process_banner_image: {traceback.format_exc()}")
-        # Return a fallback image with error message
         fallback = Image.new("RGB", (2048, 512), (50, 50, 50))
         draw = ImageDraw.Draw(fallback)
         try:
@@ -243,29 +231,32 @@ async def get_banner(uid: str):
         data = resp.json()
         logger.info(f"Response keys: {data.keys() if isinstance(data, dict) else 'non-dict'}")
 
+        # Check for API errors
         if isinstance(data, dict):
             if "error" in data:
                 raise HTTPException(status_code=404, detail=f"Info API error: {data['error']}")
             if "message" in data and "not found" in data["message"].lower():
                 raise HTTPException(status_code=404, detail=f"Info API error: {data['message']}")
 
-        basic_info = data.get("basicInfo")
+        # New API structure
+        basic_info = data.get("basic_info")
         if not basic_info:
             error_msg = data.get("error") or data.get("message") or "User not found or invalid UID"
             raise HTTPException(status_code=404, detail=error_msg)
 
-        clan_info = data.get("clanBasicInfo", {})
-        profile_info = data.get("profileInfo", {})
+        clan_info = data.get("clan_basic_info", {})
+        # No profile_info needed for avatar, we use head_pic from basic_info
 
         level = basic_info.get("level", "Not Found")
         name = basic_info.get("nickname", "Not Found")
-        guild = clan_info.get("clanName") or clan_info.get("name") or "Not Found"
+        guild = clan_info.get("clan_name", "Not Found")
 
-        avatar_id = profile_info.get("avatarId")
-        banner_id = basic_info.get("bannerId")
-        badge_id = basic_info.get("badgeId")
+        # Avatar is head_pic, not avatar_id
+        avatar_id = basic_info.get("head_pic")
+        banner_id = basic_info.get("banner_id")
+        # Use badge_id for pin, fallback to title
+        badge_id = basic_info.get("badge_id") or basic_info.get("title")
 
-        # Fetch images in parallel
         avatar_task = fetch_image_bytes(avatar_id)
         banner_task = fetch_image_bytes(banner_id)
         badge_task = fetch_image_bytes(badge_id) if badge_id else asyncio.sleep(0)
