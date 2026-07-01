@@ -81,6 +81,7 @@ def is_cherokee(char):
     return (0x13A0 <= code <= 0x13FF) or (0xAB70 <= code <= 0xABBF)
 
 def measure_mixed_text(draw, text, size):
+    """Measure total width of a string that may contain Cherokee characters."""
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
     total_width = 0
@@ -90,30 +91,23 @@ def measure_mixed_text(draw, text, size):
     return total_width
 
 def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shadow_color='black', fill='white'):
+    """Draw text with a drop shadow."""
     x, y = xy
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
+    # Draw shadow
     sx, sy = shadow_offset
     current_x = x + sx
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y + sy), char, font=font, fill=shadow_color)
         current_x += font.getlength(char)
+    # Draw main text
     current_x = x
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y), char, font=font, fill=fill)
         current_x += font.getlength(char)
-
-def crop_image(img, left, top, right, bottom):
-    w, h = img.size
-    left = max(0, left)
-    top = max(0, top)
-    right = min(w, right)
-    bottom = min(h, bottom)
-    if right <= left or bottom <= top:
-        return img
-    return img.crop((left, top, right, bottom))
 
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
@@ -129,53 +123,63 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # ----- Avatar processing -----
-        avatar_img = crop_image(avatar_img, 40, 40, avatar_img.width - 40, avatar_img.height - 40)
+        # Avatar with border
         avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
         bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner processing (new) -----
-        # 1. Rotate 3.4° counter‑clockwise
-        banner_img = banner_img.rotate(3.4, resample=Image.BICUBIC, expand=True)
+        # Banner processing
         b_w, b_h = banner_img.size
+        if b_w > 50 and b_h > 50:
+            banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
+            b_w, b_h = banner_img.size
+            crop_top, crop_bottom, crop_sides = 0.23, 0.32, 0.17
+            left, top = b_w * crop_sides, b_h * crop_top
+            right, bottom = b_w * (1 - crop_sides), b_h * (1 - crop_bottom)
+            banner_img = banner_img.crop((left, top, right, bottom))
 
-        # 2. Calculate dynamic crop margins
-        left_crop = int(b_w * 0.125)
-        top_crop = int(b_h * 0.10)
-        right_crop = int(b_w * 0.1875)
-        bottom_crop = int(b_h * 0.525)
+        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
+        b_w, b_h = banner_img.size
+        if b_h > 0:
+            scale = CANVAS_H / b_h
+            new_banner_w = int(b_w * scale)
+            if new_banner_w < target_banner_w:
+                scale = target_banner_w / b_w
+                new_banner_h = int(b_h * scale)
+                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
+            else:
+                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
+            b_w, b_h = banner_img.size
+            if b_w > target_banner_w:
+                left = (b_w - target_banner_w) // 2
+                right = left + target_banner_w
+                banner_img = banner_img.crop((left, 0, right, CANVAS_H))
+            else:
+                banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
+        else:
+            banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
 
-        # 3. Crop the rotated image
-        banner_img = crop_image(
-            banner_img,
-            left_crop,
-            top_crop,
-            b_w - right_crop,
-            b_h - bottom_crop
-        )
-
-        # 4. Resize to exactly fill the target banner area (stretch to fill)
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER  # 1536
-        banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
-
-        # ----- Combine -----
+        # Combine
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
         combined.paste(bordered_avatar, (0, 0), bordered_avatar)
         combined.paste(banner_img, (AVATAR_SIZE + 2 * BORDER, 0))
 
         draw = ImageDraw.Draw(combined)
 
-        # ----- Text drawing -----
+        # ----- Text drawing (shadow style) -----
         name_size = 84
         guild_size = 84
         level_size = 78
 
-        text_x = AVATAR_SIZE + 2 * BORDER + 58
+        text_x = AVATAR_SIZE + 2 * BORDER + 58  # avatar box width + border + offset
 
+        # Draw nickname
         draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size, shadow_offset=(3, 3))
+
+        # Draw guild name
         draw_mixed_text_with_shadow(draw, (text_x, 330), guild_name, guild_size, shadow_offset=(3, 3))
 
+        # Draw level (right‑bottom aligned)
         level_text = f"Lvl. {level}"
         lw = measure_mixed_text(draw, level_text, level_size)
         level_x = CANVAS_W - lw - 50
