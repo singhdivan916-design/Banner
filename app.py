@@ -93,35 +93,29 @@ def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shad
     x, y = xy
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
+    # Draw shadow
     sx, sy = shadow_offset
     current_x = x + sx
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y + sy), char, font=font, fill=shadow_color)
         current_x += font.getlength(char)
+    # Draw main text
     current_x = x
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y), char, font=font, fill=fill)
         current_x += font.getlength(char)
 
-def crop_image_force(img, left, top, right, bottom):
-    """
-    Crop the image. If the crop bounds exceed the image, clamp them.
-    Returns a cropped copy (never returns original).
-    """
+def crop_image(img, left, top, right, bottom):
+    """Crop image and return cropped copy, or original if invalid."""
     w, h = img.size
-    # Clamp bounds to [0, w] and [0, h]
-    left = max(0, min(left, w - 1))
-    top = max(0, min(top, h - 1))
-    right = max(0, min(right, w))
-    bottom = max(0, min(bottom, h))
-    # Ensure we have positive width/height
-    if right <= left:
-        right = left + 1  # at least 1 pixel
-    if bottom <= top:
-        bottom = top + 1
-    logger.info(f"Cropping from ({left},{top}) to ({right},{bottom}) on image {w}x{h}")
+    if left < 0: left = 0
+    if top < 0: top = 0
+    if right > w: right = w
+    if bottom > h: bottom = h
+    if right <= left or bottom <= top:
+        return img
     return img.crop((left, top, right, bottom))
 
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
@@ -138,59 +132,48 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # ----- Avatar processing -----
-        logger.info(f"Avatar original size: {avatar_img.size}")
-        avatar_img = crop_image_force(avatar_img, 40, 40, avatar_img.width - 40, avatar_img.height - 40)
-        logger.info(f"Avatar after crop: {avatar_img.size}")
+        # ----- Avatar processing (unchanged) -----
+        avatar_img = crop_image(avatar_img, 40, 40, avatar_img.width - 40, avatar_img.height - 40)
         avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
         bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner processing -----
-        logger.info(f"Banner original size: {banner_img.size}")
-        # Crop: 200px left, 32px top, right, bottom
-        banner_img = crop_image_force(banner_img, 200, 32, banner_img.width - 32, banner_img.height - 32)
-        logger.info(f"Banner after initial crop: {banner_img.size}")
+        # ----- Banner processing (centered, no extra cropping) -----
+        # 1. Crop source: 200 left, 32 top, right, bottom
+        b_w, b_h = banner_img.size
+        banner_img = crop_image(banner_img, 200, 32, b_w - 32, b_h - 32)
 
-        # Rotate and crop further
+        # 2. Rotate 3 degrees (optional)
         b_w, b_h = banner_img.size
         if b_w > 50 and b_h > 50:
             banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
-            b_w, b_h = banner_img.size
-            crop_top, crop_bottom, crop_sides = 0.23, 0.32, 0.17
-            left = b_w * crop_sides
-            top = b_h * crop_top
-            right = b_w * (1 - crop_sides)
-            bottom = b_h * (1 - crop_bottom)
-            banner_img = banner_img.crop((left, top, right, bottom))
-            logger.info(f"Banner after rotation crop: {banner_img.size}")
 
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
+        # 3. Target area for the banner (right side)
+        target_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER  # = 1508
+        target_h = CANVAS_H
+
+        # 4. Scale to fit inside target_w x target_h while preserving aspect ratio
         b_w, b_h = banner_img.size
-        if b_h > 0:
-            scale = CANVAS_H / b_h
-            new_banner_w = int(b_w * scale)
-            if new_banner_w < target_banner_w:
-                scale = target_banner_w / b_w
-                new_banner_h = int(b_h * scale)
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            else:
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            b_w, b_h = banner_img.size
-            if b_w > target_banner_w:
-                left = (b_w - target_banner_w) // 2
-                right = left + target_banner_w
-                banner_img = banner_img.crop((left, 0, right, CANVAS_H))
-            else:
-                banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
-            logger.info(f"Banner final size: {banner_img.size}")
-        else:
-            banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
+        if b_w > 0 and b_h > 0:
+            # Calculate scaling factor to fit inside target box
+            scale = min(target_w / b_w, target_h / b_h)
+            new_w = int(b_w * scale)
+            new_h = int(b_h * scale)
+            banner_img = banner_img.resize((new_w, new_h), Image.LANCZOS)
 
-        # Combine
+            # 5. Create a transparent canvas of target size
+            banner_canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            # Paste centered
+            x_offset = (target_w - new_w) // 2
+            y_offset = (target_h - new_h) // 2
+            banner_canvas.paste(banner_img, (x_offset, y_offset), banner_img)
+        else:
+            banner_canvas = Image.new("RGBA", (target_w, target_h), (50, 50, 50))
+
+        # ----- Combine -----
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
         combined.paste(bordered_avatar, (0, 0), bordered_avatar)
-        combined.paste(banner_img, (AVATAR_SIZE + 2 * BORDER, 0))
+        combined.paste(banner_canvas, (AVATAR_SIZE + 2 * BORDER, 0))
 
         draw = ImageDraw.Draw(combined)
 
