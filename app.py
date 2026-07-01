@@ -1,417 +1,234 @@
-"""
-Free Fire Profile Banner Generator API
-========================================
-
-GET /banner?uid=<uid>            -> PNG image (inline)
-GET /banner?uid=<uid>&dl=1        -> PNG image (as attachment / forced download)
-GET /health                       -> simple health check
-
-How it works
-------------
-1. Calls the player-info API to get the account data for the given uid.
-2. Pulls out only the fields the card actually needs (nickname, guild,
-   level, bannerId, headPic, badgeId, primeLevel).
-3. Downloads the matching item art (banner background / avatar / badge)
-   from the jsDelivr icon CDN.
-4. Composites everything with Pillow into a 2048x512 card that matches
-   the reference layout (avatar box on the left, banner + name/guild/level
-   text on the right) and streams it back as a PNG.
-
-Run:
-    pip install -r requirements.txt
-    python app.py
-    -> http://localhost:5000/banner?uid=14709492693
-"""
-
 import io
 import os
-import time
-import logging
-import threading
-import traceback
-from pathlib import Path
-from typing import Optional, Tuple
+import asyncio
+import httpx
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Response, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, ImageDraw, ImageFont
+from concurrent.futures import ThreadPoolExecutor
 
-import requests
-from flask import Flask, request, send_file, jsonify
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await client.aclose()
+    process_pool.shutdown()
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
+app = FastAPI(lifespan=lifespan)
 
-PLAYER_INFO_API = "https://info.killersharmabot.online/player-info?uid={uid}"
-ICON_CDN = "https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG/{item_id}.png"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-HTTP_TIMEOUT = 10
-PLAYER_CACHE_TTL = 60 * 5      # 5 minutes - player stats change
-IMAGE_CACHE_TTL = 60 * 60 * 24  # 24 hours - cosmetic art almost never changes
+INFO_API_URL = "https://info.killersharmabot.online/player-info"
+FONT_FILE = "arial_unicode_bold.otf"
+FONT_CHEROKEE = "NotoSansCherokee.ttf"
 
-CANVAS_W, CANVAS_H = 2048, 512
-AVATAR_BOX = 512          # left square panel (== canvas height)
-BORDER = 14                # white border thickness around the avatar art
-BADGE_SIZE = 118           # bottom-left hex badge
-CROWN_W, CROWN_H = 150, 108  # top-right prime-level crown
+client = httpx.AsyncClient(
+    headers={"User-Agent": "Mozilla/5.0"},
+    timeout=10.0,
+    follow_redirects=True
+)
 
-BASE_DIR = Path(__file__).resolve().parent
+process_pool = ThreadPoolExecutor(max_workers=4)
 
-FONT_PATH = str(BASE_DIR / "Poppins-Bold.ttf")
-# FF nicknames are often full of decorative Unicode (circled letters,
-# Cherokee/Coptic look-alikes, etc.) that Poppins doesn't contain glyphs
-# for. FreeSans has much broader coverage, so it's used as a fallback for
-# any character Poppins can't render, character-by-character.
-FALLBACK_FONT_PATH = str(BASE_DIR / "FreeSansBold.ttf")
-
-# Set FF_BANNER_DEBUG=1 in your environment (or hit the route with
-# ?debug=1) to get the real exception + traceback back in the JSON error
-# response instead of the generic message. Handy on platforms like Vercel
-# where you may not have easy access to function logs.
-DEBUG_ERRORS = os.environ.get("FF_BANNER_DEBUG") == "1"
-
-app = Flask(__name__)
-log = logging.getLogger("ff_banner")
-logging.basicConfig(level=logging.INFO)
-
-# --------------------------------------------------------------------------
-# Tiny in-memory TTL caches (swap for redis/memcached if you scale this out)
-# --------------------------------------------------------------------------
-
-_lock = threading.Lock()
-_player_cache = {}   # uid -> (expires_at, json)
-_image_cache = {}    # item_id -> (expires_at, PIL.Image in RGBA)
-
-
-def _cache_get(cache: dict, key):
-    with _lock:
-        entry = cache.get(key)
-        if not entry:
-            return None
-        expires_at, value = entry
-        if time.time() > expires_at:
-            cache.pop(key, None)
-            return None
-        return value
-
-
-def _cache_set(cache: dict, key, value, ttl):
-    with _lock:
-        cache[key] = (time.time() + ttl, value)
-
-
-# --------------------------------------------------------------------------
-# Data fetching
-# --------------------------------------------------------------------------
-
-class PlayerNotFound(Exception):
-    pass
-
-
-class UpstreamError(Exception):
-    pass
-
-
-def fetch_player_info(uid: str) -> dict:
-    cached = _cache_get(_player_cache, uid)
-    if cached is not None:
-        return cached
-
-    url = PLAYER_INFO_API.format(uid=uid)
+def load_unicode_font(size, font_file=FONT_FILE):
     try:
-        resp = requests.get(url, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
-        raise UpstreamError(f"player-info request failed: {exc}") from exc
+        font_path = os.path.join(os.path.dirname(__file__), font_file)
+        if os.path.exists(font_path):
+            return ImageFont.truetype(font_path, size)
+        return ImageFont.load_default()
+    except:
+        return ImageFont.load_default()
 
-    if resp.status_code == 404:
-        raise PlayerNotFound(uid)
-    if resp.status_code != 200:
-        raise UpstreamError(f"player-info returned HTTP {resp.status_code}")
-
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise UpstreamError("player-info returned invalid JSON") from exc
-
-    if not data or "basicInfo" not in data:
-        raise PlayerNotFound(uid)
-
-    _cache_set(_player_cache, uid, data, PLAYER_CACHE_TTL)
-    return data
-
-
-def fetch_item_image(item_id) -> Optional[Image.Image]:
-    """Download a cosmetic PNG from the icon CDN. Returns None on failure
-    so the caller can fall back to a placeholder instead of crashing the
-    whole banner."""
-    if not item_id:
+async def fetch_image_bytes(item_id):
+    if not item_id or str(item_id) == "0" or item_id is None:
         return None
 
-    cached = _cache_get(_image_cache, item_id)
-    if cached is not None:
-        return cached
-
-    url = ICON_CDN.format(item_id=item_id)
-    try:
-        resp = requests.get(url, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-    except Exception as exc:  # noqa: BLE001 - any failure just means "no art"
-        log.warning("Could not fetch icon %s: %s", item_id, exc)
-        return None
-
-    _cache_set(_image_cache, item_id, img, IMAGE_CACHE_TTL)
-    return img
-
-
-# --------------------------------------------------------------------------
-# Image helpers
-# --------------------------------------------------------------------------
-
-def cover_resize(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Resize + center-crop `img` so it fully covers a target_w x target_h
-    box (like CSS `background-size: cover`)."""
-    src_w, src_h = img.size
-    scale = max(target_w / src_w, target_h / src_h)
-    new_w, new_h = round(src_w * scale), round(src_h * scale)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    return img.crop((left, top, left + target_w, top + target_h))
-
-
-def placeholder(w: int, h: int, label: str, color=(60, 60, 66)) -> Image.Image:
-    """Neutral placeholder used whenever an icon can't be downloaded."""
-    img = Image.new("RGBA", (w, h), (*color, 255))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([0, 0, w - 1, h - 1], outline=(120, 120, 130, 255), width=2)
-    try:
-        font = ImageFont.truetype(FONT_PATH, max(10, h // 8))
-        bbox = draw.textbbox((0, 0), label, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((w - tw) / 2, (h - th) / 2), label, font=font,
-                   fill=(220, 220, 225, 255))
-    except Exception:
-        pass
-    return img
-
-
-def draw_text_with_shadow(draw: ImageDraw.ImageDraw, xy, text, font,
-                           fill=(255, 255, 255, 255),
-                           shadow=(0, 0, 0, 160), offset=(0, 4)):
-    x, y = xy
-    draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow)
-    draw.text((x, y), text, font=font, fill=fill)
-
-
-_font_cache = {}
-_cmap_cache = {}
-
-
-def _get_font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    key = (path, size)
-    font = _font_cache.get(key)
-    if font is None:
-        font = ImageFont.truetype(path, size)
-        _font_cache[key] = font
-    return font
-
-
-def _get_cmap(path: str) -> set:
-    cmap = _cmap_cache.get(path)
-    if cmap is None:
+    item_id = str(item_id)
+    
+    # Try all batch folders (01 to 36)
+    for batch_num in range(1, 37):
+        batch_str = f"{batch_num:02d}"
+        url = f"https://raw.githubusercontent.com/danger738/danger-item-library/main/PNG/{batch_str}/{item_id}.png"
+        
         try:
-            from fontTools.ttLib import TTFont
-            tt = TTFont(path, fontNumber=0, lazy=True)
-            cmap = set(tt.getBestCmap().keys())
-        except Exception:
-            cmap = set()  # if fontTools isn't available, just skip fallback
-        _cmap_cache[path] = cmap
-    return cmap
+            resp = await client.head(url)
+            if resp.status_code == 200:
+                img_resp = await client.get(url)
+                return img_resp.content
+        except:
+            continue
+    return None
 
+def bytes_to_image(img_bytes):
+    if img_bytes:
+        return Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    return Image.new('RGBA', (100, 100), (0, 0, 0, 0))
 
-def _font_for_char(ch: str, size: int) -> ImageFont.FreeTypeFont:
-    """Pick Poppins if it has the glyph, else fall back to FreeSans."""
-    if ch == " " or ord(ch) in _get_cmap(FONT_PATH):
-        return _get_font(FONT_PATH, size)
-    if ord(ch) in _get_cmap(FALLBACK_FONT_PATH):
-        return _get_font(FALLBACK_FONT_PATH, size)
-    return _get_font(FONT_PATH, size)  # neither has it -> tofu box, rare
+def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
+    avatar_img = bytes_to_image(avatar_bytes)
+    banner_img = bytes_to_image(banner_bytes)
+    pin_img = bytes_to_image(pin_bytes)
 
+    level = str(data.get("AccountLevel", "Not Found"))
+    name = data.get("AccountName", "Not Found")
+    guild = data.get("GuildName", "Not Found")
 
-def measure_mixed_text(draw: ImageDraw.ImageDraw, text: str, size: int) -> int:
-    return sum(draw.textlength(ch, font=_font_for_char(ch, size)) for ch in text)
+    TARGET_HEIGHT = 400 
+    avatar_img = avatar_img.resize((TARGET_HEIGHT, TARGET_HEIGHT), Image.LANCZOS)
+    
+    b_w, b_h = banner_img.size
+    if b_w > 50 and b_h > 50:
+        banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
+        b_w, b_h = banner_img.size
+        
+        crop_top, crop_bottom, crop_sides = 0.23, 0.32, 0.17
+        left, top = b_w * crop_sides, b_h * crop_top
+        right, bottom = b_w * (1 - crop_sides), b_h * (1 - crop_bottom)
+        banner_img = banner_img.crop((left, top, right, bottom))
 
+    b_w, b_h = banner_img.size
+    if b_h > 0:
+        new_banner_w = int(TARGET_HEIGHT * (b_w / b_h) * 2.0)
+        banner_img = banner_img.resize((new_banner_w, TARGET_HEIGHT), Image.LANCZOS)
+    else:
+        banner_img = Image.new("RGBA", (800, 400), (50, 50, 50))
 
-def draw_mixed_text_with_shadow(draw: ImageDraw.ImageDraw, xy, text: str, size: int,
-                                 fill=(255, 255, 255, 255),
-                                 shadow=(0, 0, 0, 160), offset=(0, 4)):
-    """Draws `text` left-to-right, choosing a glyph-covering font per
-    character so unusual Unicode nicknames don't render as boxes."""
-    x, y = xy
-    for ch in text:
-        font = _font_for_char(ch, size)
-        draw.text((x + offset[0], y + offset[1]), ch, font=font, fill=shadow)
-        draw.text((x, y), ch, font=font, fill=fill)
-        x += draw.textlength(ch, font=font)
-    return x
+    final_w = TARGET_HEIGHT + new_banner_w
+    final_h = TARGET_HEIGHT
+    combined = Image.new("RGBA", (final_w, final_h), (0, 0, 0, 0))
+    combined.paste(avatar_img, (0, 0))
+    combined.paste(banner_img, (TARGET_HEIGHT, 0))
+    
+    draw = ImageDraw.Draw(combined)
+    
+    font_large = load_unicode_font(125) 
+    font_large_cherokee = load_unicode_font(125, FONT_CHEROKEE)
+    font_small = load_unicode_font(95) 
+    font_small_cherokee = load_unicode_font(95, FONT_CHEROKEE)
+    font_level = load_unicode_font(50)
 
+    text_x = TARGET_HEIGHT + 40 
+    text_y = 40 
+    
+    def is_cherokee(char):
+        code = ord(char)
+        return (0x13A0 <= code <= 0x13FF) or (0xAB70 <= code <= 0xABBF)
 
-def draw_crown_badge(canvas: Image.Image, top_right_xy: Tuple[int, int],
-                      number: int):
-    """Draws the small gold 'prime level' crown badge (top-right corner of
-    the avatar box) since the player-info API only gives us the number,
-    not an icon id for it."""
-    w, h = CROWN_W, CROWN_H
-    badge = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(badge)
+    def draw_text_with_stroke(x, y, text, font_main, font_fallback, size):
+        current_x = x
+        for char in text:
+            font = font_fallback if is_cherokee(char) else font_main
+            
+            # Draw stroke
+            for dx in range(-size, size + 1):
+                for dy in range(-size, size + 1):
+                    draw.text((current_x + dx, y + dy), char, font=font, fill=stroke_col)
+            
+            # Draw text
+            draw.text((current_x, y), char, font=font, fill=text_col)
+            
+            # Advance cursor
+            char_width = font.getlength(char)
+            current_x += char_width
 
-    gold = (255, 196, 64, 255)
-    gold_dark = (196, 130, 20, 255)
+    stroke_col, text_col = "black", "white"
+    draw_text_with_stroke(text_x + 25, text_y, name, font_large, font_large_cherokee, 4)
+    draw_text_with_stroke(text_x + 25, text_y + 200, guild, font_small, font_small_cherokee, 3)
 
-    # crown silhouette: three peaks
-    pts = [
-        (w * 0.06, h * 0.95), (w * 0.06, h * 0.42), (w * 0.24, h * 0.60),
-        (w * 0.5, h * 0.05), (w * 0.76, h * 0.60), (w * 0.94, h * 0.42),
-        (w * 0.94, h * 0.95),
-    ]
-    d.polygon(pts, fill=gold, outline=gold_dark)
-    d.rectangle([w * 0.06, h * 0.85, w * 0.94, h * 0.98], fill=gold_dark)
+    if pin_img and pin_img.size != (100, 100):
+        pin_size = 130 
+        pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
+        combined.paste(pin_img, (0, TARGET_HEIGHT - pin_size), pin_img)
 
+    level_txt = f"Lvl.{level}"
     try:
-        font = ImageFont.truetype(FONT_PATH, int(h * 0.5))
-        text = str(number)
-        bbox = d.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        d.text(((w - tw) / 2, h * 0.42 - th / 2), text, font=font,
-               fill=(80, 40, 0, 255))
-    except Exception:
-        pass
+        bbox = draw.textbbox((0, 0), level_txt, font=font_level)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except:
+        text_w, text_h = len(level_txt) * 20, 40
 
-    canvas.alpha_composite(badge, dest=top_right_xy)
+    px, py = 25, 16
+    box_x = final_w - (text_w + px * 2)
+    box_y = final_h - (text_h + py * 2)
+    
+    draw.rectangle([box_x, box_y, final_w, final_h], fill="black")
+    draw.text((box_x + px, box_y + py - 6), level_txt, font=font_level, fill="white")
 
+    img_io = io.BytesIO()
+    combined.save(img_io, 'PNG')
+    img_io.seek(0)
+    return img_io
 
-# --------------------------------------------------------------------------
-# Core compositing
-# --------------------------------------------------------------------------
+@app.get("/")
+async def home():
+    return {"message": "⚡ Ultra Fast Banner API Running",
+           "Telegram": "@FireXDecoder",
+           "Api Endpoint": "/banner?uid={uid}",
+           "Note": "Join To @FireXDecoding For More 💝"
+    }
 
-def build_banner(uid: str) -> Image.Image:
-    data = fetch_player_info(uid)
-
-    basic = data.get("basicInfo", {}) or {}
-    clan = data.get("clanBasicInfo", {}) or {}
-
-    nickname = basic.get("nickname") or "Unknown"
-    level = basic.get("level", "?")
-    banner_id = basic.get("bannerId")
-    head_pic_id = basic.get("headPic")
-    badge_id = basic.get("badgeId")
-    prime_level = (basic.get("primeLevel") or {}).get("level")
-    guild_name = clan.get("clanName") or "Solo Player"
-
-    banner_art = fetch_item_image(banner_id)
-    avatar_art = fetch_item_image(head_pic_id)
-    badge_art = fetch_item_image(badge_id)
-
-    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (10, 10, 10, 255))
-
-    # ---- right side: banner background art -------------------------------
-    right_w = CANVAS_W - AVATAR_BOX
-    if banner_art:
-        bg = cover_resize(banner_art, right_w, CANVAS_H)
-    else:
-        bg = placeholder(right_w, CANVAS_H, "NO BANNER", color=(30, 30, 34))
-    canvas.alpha_composite(bg, dest=(AVATAR_BOX, 0))
-
-    # subtle left->right dark gradient behind the text for readability
-    grad = Image.new("L", (right_w, CANVAS_H), 0)
-    gdraw = ImageDraw.Draw(grad)
-    fade_w = int(right_w * 0.55)
-    for x in range(fade_w):
-        alpha = int(150 * (1 - x / fade_w))
-        gdraw.line([(x, 0), (x, CANVAS_H)], fill=alpha)
-    shade = Image.new("RGBA", (right_w, CANVAS_H), (0, 0, 0, 255))
-    shade.putalpha(grad)
-    canvas.alpha_composite(shade, dest=(AVATAR_BOX, 0))
-
-    # ---- left side: white panel + avatar art ------------------------------
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle([0, 0, AVATAR_BOX - 1, CANVAS_H - 1], fill=(255, 255, 255, 255))
-
-    inner = AVATAR_BOX - 2 * BORDER
-    if avatar_art:
-        av = cover_resize(avatar_art, inner, inner)
-    else:
-        av = placeholder(inner, inner, "NO AVATAR", color=(70, 130, 180))
-    canvas.alpha_composite(av, dest=(BORDER, BORDER))
-
-    # crown / prime-level badge, top-right corner of the avatar box
-    if prime_level is not None:
-        draw_crown_badge(canvas, (AVATAR_BOX - CROWN_W - 6, 6), prime_level)
-
-    # rank/season badge, bottom-left corner of the avatar box
-    if badge_art:
-        b = badge_art.resize((BADGE_SIZE, BADGE_SIZE), Image.LANCZOS)
-    else:
-        b = placeholder(BADGE_SIZE, BADGE_SIZE, "BADGE", color=(40, 40, 46))
-    canvas.alpha_composite(b, dest=(8, AVATAR_BOX - BADGE_SIZE - 8))
-
-    # ---- text: name / guild / level ---------------------------------------
-    draw = ImageDraw.Draw(canvas)
-    name_size = 84
-    guild_size = 84
-    level_size = 78
-
-    text_x = AVATAR_BOX + 58
-    draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size)
-    draw_mixed_text_with_shadow(draw, (text_x, 330), guild_name, guild_size)
-
-    level_text = f"Lvl. {level}"
-    lw = measure_mixed_text(draw, level_text, level_size)
-    draw_mixed_text_with_shadow(draw, (CANVAS_W - lw - 50, CANVAS_H - 120),
-                                 level_text, level_size)
-
-    return canvas.convert("RGB")
-
-
-# --------------------------------------------------------------------------
-# Routes
-# --------------------------------------------------------------------------
-
-@app.route("/banner")
-def banner_route():
-    uid = request.args.get("uid", "").strip()
+@app.get("/banner-image")
+async def get_banner(uid: str):
     if not uid:
-        return jsonify(error="Missing required query param 'uid'"), 400
+        raise HTTPException(status_code=400, detail="UID required")
 
     try:
-        img = build_banner(uid)
-    except PlayerNotFound:
-        return jsonify(error=f"No player found for uid '{uid}'"), 404
-    except UpstreamError as exc:
-        return jsonify(error=str(exc)), 502
-    except Exception as exc:  # noqa: BLE001
-        log.exception("Unexpected error building banner for uid=%s", uid)
-        if DEBUG_ERRORS or request.args.get("debug") == "1":
-            return jsonify(
-                error="Internal error generating banner",
-                exception=f"{type(exc).__name__}: {exc}",
-                traceback=traceback.format_exc().splitlines(),
-            ), 500
-        return jsonify(error="Internal error generating banner"), 500
+        resp = await client.get(f"{INFO_API_URL}?uid={uid}")
+        
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Info API Error")
+            
+        data = resp.json()
+        
+        # Extract data from new API structure
+        basic_info = data.get("basicInfo", {})
+        clan_info = data.get("clanBasicInfo", {})
+        profile_info = data.get("profileInfo", {})
+        
+        if not basic_info:
+            raise HTTPException(status_code=404, detail="Not Found")
+        
+        level = basic_info.get("level", "Not Found")
+        name = basic_info.get("nickname", "Not Found")
+        guild = clan_info.get("clanName") or clan_info.get("name") or "Not Found"
+        
+        avatar_id = profile_info.get("avatarId")
+        banner_id = basic_info.get("bannerId")
+        pin_id = basic_info.get("badgeId")  # Use badge as pin, if available
+        
+        avatar_task = fetch_image_bytes(avatar_id)
+        banner_task = fetch_image_bytes(banner_id)
+        pin_task = fetch_image_bytes(pin_id) if pin_id else asyncio.sleep(0)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    buf.seek(0)
+        results = await asyncio.gather(avatar_task, banner_task, pin_task)
+        avatar_bytes, banner_bytes, pin_bytes = results[0], results[1], results[2]
+        
+        if pin_bytes is None: pin_bytes = b''
 
-    as_attachment = request.args.get("dl") == "1"
-    return send_file(buf, mimetype="image/png", as_attachment=as_attachment,
-                      download_name=f"{uid}_banner.png" if as_attachment else None,
-                      max_age=300)
+        loop = asyncio.get_event_loop()
+        banner_data = {
+            "AccountLevel": level,
+            "AccountName": name,
+            "GuildName": guild
+        }
+        
+        img_io = await loop.run_in_executor(
+            process_pool, 
+            process_banner_image, 
+            banner_data, avatar_bytes, banner_bytes, pin_bytes
+        )
+        
+        return Response(content=img_io.getvalue(), media_type="image/png", headers={"Cache-Control": "public, max-age=300"})
 
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/health")
-def health():
-    return jsonify(status="ok")
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=5000)
