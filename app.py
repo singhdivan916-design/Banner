@@ -2,11 +2,16 @@ import io
 import os
 import asyncio
 import httpx
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from concurrent.futures import ThreadPoolExecutor
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,7 +55,6 @@ async def fetch_image_bytes(item_id):
 
     item_id = str(item_id)
     
-    # Try all batch folders (01 to 36)
     for batch_num in range(1, 37):
         batch_str = f"{batch_num:02d}"
         url = f"https://raw.githubusercontent.com/danger738/danger-item-library/main/PNG/{batch_str}/{item_id}.png"
@@ -124,15 +128,12 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         for char in text:
             font = font_fallback if is_cherokee(char) else font_main
             
-            # Draw stroke
             for dx in range(-size, size + 1):
                 for dy in range(-size, size + 1):
                     draw.text((current_x + dx, y + dy), char, font=font, fill=stroke_col)
             
-            # Draw text
             draw.text((current_x, y), char, font=font, fill=text_col)
             
-            # Advance cursor
             char_width = font.getlength(char)
             current_x += char_width
 
@@ -167,9 +168,11 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
 @app.get("/")
 async def home():
     return {"message": "⚡ Ultra Fast Banner API Running",
-           "Telegram": "@FireXDecoder",
-           "Api Endpoint": "/banner?uid={uid}",
-           "Note": "Join To @FireXDecoding For More 💝"
+           "Fix By": "agajayofficial",
+           "Telegram": "@agajayofficial",
+           "Your Info Api": INFO_API_URL,
+           "Api Endpoint": "/banner-image?uid={uid}",
+           "Note": "Join To @AjayApis For More 💝"
     }
 
 @app.get("/banner-image")
@@ -181,17 +184,27 @@ async def get_banner(uid: str):
         resp = await client.get(f"{INFO_API_URL}?uid={uid}")
         
         if resp.status_code != 200:
+            logger.error(f"Info API returned {resp.status_code} for UID {uid}")
             raise HTTPException(status_code=502, detail="Info API Error")
             
         data = resp.json()
+        logger.info(f"Received response for UID {uid}: {data.keys() if isinstance(data, dict) else 'non-dict'}")
         
-        # Extract data from new API structure
-        basic_info = data.get("basicInfo", {})
+        # Check for API-level errors
+        if isinstance(data, dict):
+            if "error" in data:
+                raise HTTPException(status_code=404, detail=f"Info API error: {data['error']}")
+            if "message" in data and "not found" in data["message"].lower():
+                raise HTTPException(status_code=404, detail=f"Info API error: {data['message']}")
+        
+        basic_info = data.get("basicInfo")
+        if not basic_info:
+            # If basicInfo is missing, try to extract any error message
+            error_msg = data.get("error") or data.get("message") or "User not found or invalid UID"
+            raise HTTPException(status_code=404, detail=error_msg)
+        
         clan_info = data.get("clanBasicInfo", {})
         profile_info = data.get("profileInfo", {})
-        
-        if not basic_info:
-            raise HTTPException(status_code=404, detail="Not Found")
         
         level = basic_info.get("level", "Not Found")
         name = basic_info.get("nickname", "Not Found")
@@ -199,7 +212,7 @@ async def get_banner(uid: str):
         
         avatar_id = profile_info.get("avatarId")
         banner_id = basic_info.get("bannerId")
-        pin_id = basic_info.get("badgeId")  # Use badge as pin, if available
+        pin_id = basic_info.get("badgeId")  # Using badge as pin
         
         avatar_task = fetch_image_bytes(avatar_id)
         banner_task = fetch_image_bytes(banner_id)
@@ -225,8 +238,10 @@ async def get_banner(uid: str):
         
         return Response(content=img_io.getvalue(), media_type="image/png", headers={"Cache-Control": "public, max-age=300"})
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error: {e}")
+        logger.exception(f"Unexpected error for UID {uid}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == '__main__':
