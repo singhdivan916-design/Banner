@@ -24,9 +24,12 @@ Run:
 """
 
 import io
+import os
 import time
 import logging
 import threading
+import traceback
+from pathlib import Path
 from typing import Optional, Tuple
 
 import requests
@@ -50,12 +53,20 @@ BORDER = 14                # white border thickness around the avatar art
 BADGE_SIZE = 118           # bottom-left hex badge
 CROWN_W, CROWN_H = 150, 108  # top-right prime-level crown
 
-FONT_PATH = "fonts/Poppins-Bold.ttf"
+BASE_DIR = Path(__file__).resolve().parent
+
+FONT_PATH = str(BASE_DIR / "Poppins-Bold.ttf")
 # FF nicknames are often full of decorative Unicode (circled letters,
 # Cherokee/Coptic look-alikes, etc.) that Poppins doesn't contain glyphs
 # for. FreeSans has much broader coverage, so it's used as a fallback for
 # any character Poppins can't render, character-by-character.
-FALLBACK_FONT_PATH = "fonts/FreeSansBold.ttf"
+FALLBACK_FONT_PATH = str(BASE_DIR / "FreeSansBold.ttf")
+
+# Set FF_BANNER_DEBUG=1 in your environment (or hit the route with
+# ?debug=1) to get the real exception + traceback back in the JSON error
+# response instead of the generic message. Handy on platforms like Vercel
+# where you may not have easy access to function logs.
+DEBUG_ERRORS = os.environ.get("FF_BANNER_DEBUG") == "1"
 
 app = Flask(__name__)
 log = logging.getLogger("ff_banner")
@@ -379,6 +390,12 @@ def banner_route():
         return jsonify(error=str(exc)), 502
     except Exception as exc:  # noqa: BLE001
         log.exception("Unexpected error building banner for uid=%s", uid)
+        if DEBUG_ERRORS or request.args.get("debug") == "1":
+            return jsonify(
+                error="Internal error generating banner",
+                exception=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc().splitlines(),
+            ), 500
         return jsonify(error="Internal error generating banner"), 500
 
     buf = io.BytesIO()
