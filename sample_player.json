@@ -1,0 +1,31 @@
+{
+  "basicInfo": {
+    "accountId": "14709492693",
+    "accountType": 1,
+    "badgeId": 1001000098,
+    "banStatus": "Not Banned",
+    "bannerId": 901026021,
+    "bannerName": "Cobra Flash",
+    "createAt": "1770861923",
+    "exp": 38797,
+    "headPic": 902052004,
+    "headPicName": "Satoru Gojo Avatar",
+    "level": 28,
+    "levelProgress": "28.62%",
+    "nickname": "ⓋᏃ℮ηᎥη༼тσנι모",
+    "primeLevel": {"level": 1, "uid": "14709492693"},
+    "rank": 301,
+    "rankingName": "Bronze I (1000)",
+    "region": "IND",
+    "title": 905290002,
+    "titleName": "Bootcamp Graduate"
+  },
+  "clanBasicInfo": {
+    "capacity": 45,
+    "captainId": "7652807182",
+    "clanId": "3046114095",
+    "clanLevel": 3,
+    "clanName": "SOLO,HUNTING",
+    "memberNum": 45
+  }
+}
