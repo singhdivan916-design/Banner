@@ -93,30 +93,35 @@ def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shad
     x, y = xy
     font_main = load_unicode_font(size)
     font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
-    # Draw shadow
     sx, sy = shadow_offset
     current_x = x + sx
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y + sy), char, font=font, fill=shadow_color)
         current_x += font.getlength(char)
-    # Draw main text
     current_x = x
     for char in text:
         font = font_cherokee if is_cherokee(char) else font_main
         draw.text((current_x, y), char, font=font, fill=fill)
         current_x += font.getlength(char)
 
-def crop_image(img, left, top, right, bottom):
-    """Crop image and return cropped copy, or original if invalid."""
+def crop_image_force(img, left, top, right, bottom):
+    """
+    Crop the image. If the crop bounds exceed the image, clamp them.
+    Returns a cropped copy (never returns original).
+    """
     w, h = img.size
-    # Ensure crop bounds are valid
-    if left < 0: left = 0
-    if top < 0: top = 0
-    if right > w: right = w
-    if bottom > h: bottom = h
-    if right <= left or bottom <= top:
-        return img
+    # Clamp bounds to [0, w] and [0, h]
+    left = max(0, min(left, w - 1))
+    top = max(0, min(top, h - 1))
+    right = max(0, min(right, w))
+    bottom = max(0, min(bottom, h))
+    # Ensure we have positive width/height
+    if right <= left:
+        right = left + 1  # at least 1 pixel
+    if bottom <= top:
+        bottom = top + 1
+    logger.info(f"Cropping from ({left},{top}) to ({right},{bottom}) on image {w}x{h}")
     return img.crop((left, top, right, bottom))
 
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
@@ -134,20 +139,20 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         guild_name = data.get("GuildName", "Not Found")
 
         # ----- Avatar processing -----
-        # Crop 40px from all edges
-        avatar_img = crop_image(avatar_img, 40, 40, avatar_img.width - 40, avatar_img.height - 40)
-        # Resize to exactly 512x512
+        logger.info(f"Avatar original size: {avatar_img.size}")
+        avatar_img = crop_image_force(avatar_img, 40, 40, avatar_img.width - 40, avatar_img.height - 40)
+        logger.info(f"Avatar after crop: {avatar_img.size}")
         avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
-        # Add white border
         bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
         # ----- Banner processing -----
+        logger.info(f"Banner original size: {banner_img.size}")
         # Crop: 200px left, 32px top, right, bottom
-        b_w, b_h = banner_img.size
-        banner_img = crop_image(banner_img, 200, 32, b_w - 32, b_h - 32)
+        banner_img = crop_image_force(banner_img, 200, 32, banner_img.width - 32, banner_img.height - 32)
+        logger.info(f"Banner after initial crop: {banner_img.size}")
 
-        # Rotate and crop further (same as before)
+        # Rotate and crop further
         b_w, b_h = banner_img.size
         if b_w > 50 and b_h > 50:
             banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
@@ -158,6 +163,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
             right = b_w * (1 - crop_sides)
             bottom = b_h * (1 - crop_bottom)
             banner_img = banner_img.crop((left, top, right, bottom))
+            logger.info(f"Banner after rotation crop: {banner_img.size}")
 
         target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
         b_w, b_h = banner_img.size
@@ -177,6 +183,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
                 banner_img = banner_img.crop((left, 0, right, CANVAS_H))
             else:
                 banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
+            logger.info(f"Banner final size: {banner_img.size}")
         else:
             banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
 
