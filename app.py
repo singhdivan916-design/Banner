@@ -28,7 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# New info API endpoint
 INFO_API_URL = "http://187.127.175.208:5000/Bmw"
 FONT_FILE = "arial_unicode_bold.otf"
 FONT_CHEROKEE = "NotoSansCherokee.ttf"
@@ -51,13 +50,10 @@ def load_unicode_font(size, font_file=FONT_FILE):
         return ImageFont.load_default()
 
 async def fetch_image_bytes(item_id):
-    """Fetch an image from the CDN repository."""
     if not item_id or str(item_id) in ("0", "None"):
         return None
-
     item_id = str(item_id).strip()
     url = f"https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG/{item_id}.png"
-
     try:
         logger.info(f"Trying: {url}")
         resp = await client.head(url)
@@ -68,7 +64,6 @@ async def fetch_image_bytes(item_id):
     except Exception as e:
         logger.warning(f"Failed: {url} – {e}")
         return None
-
     logger.warning(f"❌ No image found for {item_id}")
     return None
 
@@ -81,6 +76,39 @@ def bytes_to_image(img_bytes):
             return Image.new('RGBA', (100, 100), (0, 0, 0, 0))
     return Image.new('RGBA', (100, 100), (0, 0, 0, 0))
 
+def is_cherokee(char):
+    code = ord(char)
+    return (0x13A0 <= code <= 0x13FF) or (0xAB70 <= code <= 0xABBF)
+
+def measure_mixed_text(draw, text, size):
+    """Measure total width of a string that may contain Cherokee characters."""
+    font_main = load_unicode_font(size)
+    font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
+    total_width = 0
+    for char in text:
+        font = font_cherokee if is_cherokee(char) else font_main
+        total_width += font.getlength(char)
+    return total_width
+
+def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shadow_color='black', fill='white'):
+    """Draw text with a drop shadow."""
+    x, y = xy
+    font_main = load_unicode_font(size)
+    font_cherokee = load_unicode_font(size, FONT_CHEROKEE)
+    # Draw shadow
+    sx, sy = shadow_offset
+    current_x = x + sx
+    for char in text:
+        font = font_cherokee if is_cherokee(char) else font_main
+        draw.text((current_x, y + sy), char, font=font, fill=shadow_color)
+        current_x += font.getlength(char)
+    # Draw main text
+    current_x = x
+    for char in text:
+        font = font_cherokee if is_cherokee(char) else font_main
+        draw.text((current_x, y), char, font=font, fill=fill)
+        current_x += font.getlength(char)
+
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
         CANVAS_W, CANVAS_H = 2048, 512
@@ -92,8 +120,8 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         pin_img = bytes_to_image(pin_bytes)
 
         level = str(data.get("AccountLevel", "Not Found"))
-        name = data.get("AccountName", "Not Found")
-        guild = data.get("GuildName", "Not Found")
+        nickname = data.get("AccountName", "Not Found")
+        guild_name = data.get("GuildName", "Not Found")
 
         # Avatar with border
         avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
@@ -138,54 +166,31 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
 
         draw = ImageDraw.Draw(combined)
 
-        # Fonts
-        font_large = load_unicode_font(160)
-        font_large_cherokee = load_unicode_font(160, FONT_CHEROKEE)
-        font_small = load_unicode_font(122)
-        font_small_cherokee = load_unicode_font(122, FONT_CHEROKEE)
-        font_level = load_unicode_font(64)
+        # ----- Text drawing (shadow style) -----
+        name_size = 84
+        guild_size = 84
+        level_size = 78
 
-        text_x = AVATAR_SIZE + 2 * BORDER + 60
-        text_y = 50
+        text_x = AVATAR_SIZE + 2 * BORDER + 58  # avatar box width + border + offset
 
-        def is_cherokee(char):
-            code = ord(char)
-            return (0x13A0 <= code <= 0x13FF) or (0xAB70 <= code <= 0xABBF)
+        # Draw nickname
+        draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size, shadow_offset=(3, 3))
 
-        def draw_text_with_stroke(x, y, text, font_main, font_fallback, size):
-            current_x = x
-            for char in text:
-                font = font_fallback if is_cherokee(char) else font_main
-                for dx in range(-size, size + 1):
-                    for dy in range(-size, size + 1):
-                        draw.text((current_x + dx, y + dy), char, font=font, fill=stroke_col)
-                draw.text((current_x, y), char, font=font, fill=text_col)
-                char_width = font.getlength(char)
-                current_x += char_width
+        # Draw guild name
+        draw_mixed_text_with_shadow(draw, (text_x, 330), guild_name, guild_size, shadow_offset=(3, 3))
 
-        stroke_col, text_col = "black", "white"
-        draw_text_with_stroke(text_x, text_y, name, font_large, font_large_cherokee, 4)
-        draw_text_with_stroke(text_x, text_y + 240, guild, font_small, font_small_cherokee, 3)
+        # Draw level (right‑bottom aligned)
+        level_text = f"Lvl. {level}"
+        lw = measure_mixed_text(draw, level_text, level_size)
+        level_x = CANVAS_W - lw - 50
+        level_y = CANVAS_H - 120
+        draw_mixed_text_with_shadow(draw, (level_x, level_y), level_text, level_size, shadow_offset=(3, 3))
 
-        # Pin badge
+        # ----- Pin badge (lower left) -----
         if pin_img and pin_img.size != (100, 100):
             pin_size = 160
             pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
             combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
-
-        # Level box
-        level_txt = f"Lvl.{level}"
-        try:
-            bbox = draw.textbbox((0, 0), level_txt, font=font_level)
-            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        except:
-            text_w, text_h = len(level_txt) * 30, 60
-
-        px, py = 35, 25
-        box_x = CANVAS_W - (text_w + px * 2)
-        box_y = CANVAS_H - (text_h + py * 2)
-        draw.rectangle([box_x, box_y, CANVAS_W, CANVAS_H], fill="black")
-        draw.text((box_x + px, box_y + py - 8), level_txt, font=font_level, fill="white")
 
         img_io = io.BytesIO()
         combined.save(img_io, 'PNG')
@@ -231,30 +236,25 @@ async def get_banner(uid: str):
         data = resp.json()
         logger.info(f"Response keys: {data.keys() if isinstance(data, dict) else 'non-dict'}")
 
-        # Check for API errors
         if isinstance(data, dict):
             if "error" in data:
                 raise HTTPException(status_code=404, detail=f"Info API error: {data['error']}")
             if "message" in data and "not found" in data["message"].lower():
                 raise HTTPException(status_code=404, detail=f"Info API error: {data['message']}")
 
-        # New API structure
         basic_info = data.get("basic_info")
         if not basic_info:
             error_msg = data.get("error") or data.get("message") or "User not found or invalid UID"
             raise HTTPException(status_code=404, detail=error_msg)
 
         clan_info = data.get("clan_basic_info", {})
-        # No profile_info needed for avatar, we use head_pic from basic_info
 
         level = basic_info.get("level", "Not Found")
-        name = basic_info.get("nickname", "Not Found")
-        guild = clan_info.get("clan_name", "Not Found")
+        nickname = basic_info.get("nickname", "Not Found")
+        guild_name = clan_info.get("clan_name", "Not Found")
 
-        # Avatar is head_pic, not avatar_id
         avatar_id = basic_info.get("head_pic")
         banner_id = basic_info.get("banner_id")
-        # Use badge_id for pin, fallback to title
         badge_id = basic_info.get("badge_id") or basic_info.get("title")
 
         avatar_task = fetch_image_bytes(avatar_id)
@@ -269,8 +269,8 @@ async def get_banner(uid: str):
         loop = asyncio.get_event_loop()
         banner_data = {
             "AccountLevel": level,
-            "AccountName": name,
-            "GuildName": guild
+            "AccountName": nickname,
+            "GuildName": guild_name
         }
 
         img_io = await loop.run_in_executor(
