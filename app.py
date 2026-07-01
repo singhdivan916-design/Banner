@@ -107,10 +107,10 @@ def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shad
 
 def crop_image(img, left, top, right, bottom):
     w, h = img.size
-    if left < 0: left = 0
-    if top < 0: top = 0
-    if right > w: right = w
-    if bottom > h: bottom = h
+    left = max(0, left)
+    top = max(0, top)
+    right = min(w, right)
+    bottom = min(h, bottom)
     if right <= left or bottom <= top:
         return img
     return img.crop((left, top, right, bottom))
@@ -135,44 +135,29 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner processing (updated with -3.4° rotation and exact crops) -----
+        # ----- Banner processing (new) -----
+        # 1. Rotate 3.4° counter‑clockwise
+        banner_img = banner_img.rotate(3.4, resample=Image.BICUBIC, expand=True)
         b_w, b_h = banner_img.size
-        if b_w > 50 and b_h > 50:
-            # 1. Rotate -3.4° counter-clockwise
-            banner_img = banner_img.rotate(-3.4, resample=Image.BICUBIC, expand=True)
-            b_w, b_h = banner_img.size
 
-            # 2. Crop with pixel values scaled to current image size (relative to 800x800)
-            scale_x = b_w / 800.0
-            scale_y = b_h / 800.0
-            left = int(100 * scale_x)
-            top = int(80 * scale_y)
-            right = int(b_w - 150 * scale_x)
-            bottom = int(b_h - 420 * scale_y)
+        # 2. Calculate dynamic crop margins
+        left_crop = int(b_w * 0.125)
+        top_crop = int(b_h * 0.10)
+        right_crop = int(b_w * 0.1875)
+        bottom_crop = int(b_h * 0.525)
 
-            if right > left and bottom > top:
-                banner_img = banner_img.crop((left, top, right, bottom))
+        # 3. Crop the rotated image
+        banner_img = crop_image(
+            banner_img,
+            left_crop,
+            top_crop,
+            b_w - right_crop,
+            b_h - bottom_crop
+        )
 
-        # 3. Resize to fill remaining width (height = CANVAS_H)
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
-        b_w, b_h = banner_img.size
-        if b_h > 0:
-            scale = CANVAS_H / b_h
-            new_banner_w = int(b_w * scale)
-            if new_banner_w < target_banner_w:
-                scale = target_banner_w / b_w
-                banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
-            else:
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-                b_w, b_h = banner_img.size
-                if b_w > target_banner_w:
-                    left = (b_w - target_banner_w) // 2
-                    right = left + target_banner_w
-                    banner_img = banner_img.crop((left, 0, right, CANVAS_H))
-                else:
-                    banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
-        else:
-            banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
+        # 4. Resize to exactly fill the target banner area (stretch to fill)
+        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER  # 1536
+        banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
@@ -181,12 +166,13 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
 
         draw = ImageDraw.Draw(combined)
 
-        # ----- Text drawing (shadow style) -----
+        # ----- Text drawing -----
         name_size = 84
         guild_size = 84
         level_size = 78
 
         text_x = AVATAR_SIZE + 2 * BORDER + 58
+
         draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size, shadow_offset=(3, 3))
         draw_mixed_text_with_shadow(draw, (text_x, 330), guild_name, guild_size, shadow_offset=(3, 3))
 
