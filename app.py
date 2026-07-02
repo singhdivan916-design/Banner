@@ -9,6 +9,7 @@ from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -134,6 +135,53 @@ def resize_cover(img, target_w, target_h):
     img = img.crop((left, top, left + target_w, top + target_h))
     return img
 
+def extract_banner_content(img):
+    """
+    The raw banner PNGs from the CDN are a small tilted stripe-card artwork
+    sitting inside a much larger canvas of near-black padding, jagged edges,
+    and a bright gold gradient bar along the very bottom. This crops down to
+    just the actual card artwork so only the "banner part" ends up on the
+    final image (the caller then stretches this tight crop to fill the
+    banner box edge-to-edge, per spec).
+    """
+    try:
+        rgb = img.convert("RGB")
+        arr = np.array(rgb).astype(int)
+        maxc = arr.max(axis=2)
+        H, W = maxc.shape
+        if H < 4 or W < 4:
+            return img
+
+        # 1. Detect and strip the bright gold bar strip along the very bottom
+        rowmean = maxc.mean(axis=1)
+        gold_top = H
+        for y in range(H - 1, H // 2, -1):
+            if rowmean[y] > 150:
+                gold_top = y
+            elif gold_top < H:
+                break
+        work = maxc[:gold_top, :]
+        if work.size == 0:
+            return img
+
+        # 2. Adaptive threshold to isolate the bright card art from dark margins
+        thresh = 130
+        mask = work > thresh
+        while mask.sum() < 0.10 * work.size and thresh > 50:
+            thresh -= 20
+            mask = work > thresh
+
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            return img
+
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        return img.crop((x0, y0, x1, y1))
+    except Exception as e:
+        logger.warning(f"extract_banner_content failed, using full image: {e}")
+        return img
+
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
         CANVAS_W, CANVAS_H = 2048, 512
@@ -152,14 +200,17 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # ----- Avatar with border (stretched to exactly fill its box, no gaps) -----
-        avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
+        # ----- Avatar: cover-crop (fills the box, no distortion even if the
+        # source isn't perfectly square) -----
+        avatar_img = resize_cover(avatar_img, AVATAR_SIZE, AVATAR_SIZE)
         bordered_avatar = Image.new("RGBA", (AVATAR_BOX, AVATAR_BOX), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner: stretched to exactly fill its area so only the artwork
-        # shows, with none of the source PNG's background/padding color visible -----
+        # ----- Banner: crop out the dark padding/gold bar so only the actual
+        # card artwork remains, then stretch that tight crop left-to-right to
+        # fill the banner area edge-to-edge -----
         target_banner_w = CANVAS_W - AVATAR_BOX
+        banner_img = extract_banner_content(banner_img)
         banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
