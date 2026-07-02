@@ -136,21 +136,30 @@ def resize_cover(img, target_w, target_h):
     img = img.crop((left, top, left + target_w, top + target_h))
     return img
 
-def crop_to_content(img, var_thresh=8.0, max_trim_frac=0.35):
+def crop_to_content(img, var_thresh=8.0, max_trim_frac=0.35, extra_zoom=0.0,
+                     min_dim_frac=0.18):
     """
     Background-agnostic content crop. Works regardless of what color the
     unwanted padding/frame is (black, purple, white, gradient, etc.) because
     it measures relative difference from the image's own border, not an
-    absolute brightness value:
+    absolute brightness value, and it adapts across both "high contrast
+    card vs. background" and "low contrast card vs. background" source
+    assets (the two banner styles the API returns):
 
     1. Sample the actual background color from the image's outer border ring.
-    2. Build a mask of pixels that differ meaningfully from that background.
-    3. Take the largest connected component of that mask (the real subject),
-       ignoring scattered glow/watermark speckles far from it.
+    2. Try a range of thresholds (relative to this image's own contrast) and
+       take the largest connected component at each. Reject any candidate
+       that's a sliver in either dimension (a decorative bar, not the real
+       subject) or that covers almost the whole image (background wasn't
+       separated). Among the valid candidates, keep tightening the threshold
+       as long as the component stays reasonably solid/rectangular (high
+       fill-ratio) — this is what gives a tight zoom without accidentally
+       locking onto a thin strip like a gold bar.
     4. Trim inward from each edge of that bbox while the edge row/col is
        near-uniform (low variance) — strips flat decorative bars/borders
-       (e.g. a gold strip) that survived step 3 because they differ in
-       color from the background but aren't textured "content".
+       that survived step 3.
+    5. Optionally zoom in an extra bit further (extra_zoom), to bite off the
+       soft blurred edge transition around the card.
     """
     try:
         rgb = img.convert("RGB")
@@ -168,20 +177,38 @@ def crop_to_content(img, var_thresh=8.0, max_trim_frac=0.35):
         ], axis=0)
         bg_color = np.median(border_pixels, axis=0)
         diff = np.sqrt(((arr - bg_color) ** 2).sum(axis=2))
+        mean, std = diff.mean(), diff.std()
 
-        thresh = max(40.0, diff.mean() + 0.5 * diff.std())
-        mask = diff > thresh
+        candidates = []
+        for k in [0.3, 0.6, 0.9, 1.2, 1.6, 2.0]:
+            t = mean + k * std
+            mask = diff > t
+            labeled, n = ndimage.label(mask, structure=np.ones((3, 3)))
+            if n == 0:
+                continue
+            sizes = ndimage.sum(mask, labeled, range(1, n + 1))
+            idx = np.argmax(sizes)
+            comp_size = sizes[idx]
+            comp_mask = labeled == (idx + 1)
+            ys, xs = np.where(comp_mask)
+            y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+            bh, bw = y1 - y0, x1 - x0
+            coverage = comp_size / (H * W)
+            fill_ratio = comp_size / max(1, bh * bw)
+            valid = (bh >= min_dim_frac * H and bw >= min_dim_frac * W
+                     and 0.02 < coverage < 0.93)
+            candidates.append((k, valid, fill_ratio, y0, y1, x0, x1))
 
-        labeled, n = ndimage.label(mask, structure=np.ones((3, 3)))
-        if n == 0:
+        valid_candidates = sorted([c for c in candidates if c[1]], key=lambda c: c[0])
+        if not valid_candidates:
             return img
-        sizes = ndimage.sum(mask, labeled, range(1, n + 1))
-        comp_mask = labeled == (np.argmax(sizes) + 1)
 
-        ys, xs = np.where(comp_mask)
-        if len(ys) == 0:
-            return img
-        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        chosen = valid_candidates[0]
+        for c in valid_candidates:
+            if c[2] >= 0.45:  # fill_ratio good enough -> keep tightening
+                chosen = c
+
+        _, _, _, y0, y1, x0, x1 = chosen
 
         pad = 2
         y0, x0 = max(0, y0 - pad), max(0, x0 - pad)
@@ -215,6 +242,15 @@ def crop_to_content(img, var_thresh=8.0, max_trim_frac=0.35):
                 x1 -= 1; trimmed += 1
             else:
                 break
+
+        if extra_zoom > 0:
+            zy = int((y1 - y0) * extra_zoom)
+            zx = int((x1 - x0) * extra_zoom)
+            y0, y1 = y0 + zy, y1 - zy
+            x0, x1 = x0 + zx, x1 - zx
+
+        if y1 - y0 < 4 or x1 - x0 < 4:
+            return img
 
         return img.crop((x0, y0, x1, y1))
     except Exception as e:
@@ -250,7 +286,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         # so only the actual card artwork remains, then stretch that tight
         # crop left-to-right to fill the banner area edge-to-edge -----
         target_banner_w = CANVAS_W - AVATAR_BOX
-        banner_img = crop_to_content(banner_img)
+        banner_img = crop_to_content(banner_img, extra_zoom=0.04)
         banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
