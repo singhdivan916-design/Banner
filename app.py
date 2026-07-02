@@ -109,11 +109,40 @@ def draw_mixed_text_with_shadow(draw, xy, text, size, shadow_offset=(3, 3), shad
         draw.text((current_x, y), char, font=font, fill=fill)
         current_x += font.getlength(char)
 
+def resize_cover(img, target_w, target_h):
+    """
+    Scale `img` so it fully covers a target_w x target_h box (no letterboxing,
+    no distortion), then center-crop the overflow. This replaces the old
+    rotate()+fixed-percentage-crop+stretch-resize hack, which assumed a fixed
+    source aspect ratio and produced misaligned / stretched banners whenever
+    the fetched asset didn't match that assumption.
+    """
+    if target_w <= 0 or target_h <= 0:
+        return Image.new("RGBA", (max(1, target_w), max(1, target_h)), (50, 50, 50, 255))
+
+    src_w, src_h = img.size
+    if src_w == 0 or src_h == 0:
+        return Image.new("RGBA", (target_w, target_h), (50, 50, 50, 255))
+
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = max(1, round(src_w * scale))
+    new_h = max(1, round(src_h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    img = img.crop((left, top, left + target_w, top + target_h))
+    return img
+
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     try:
         CANVAS_W, CANVAS_H = 2048, 512
-        AVATAR_SIZE = 512
         BORDER = 14
+        # The avatar box (avatar + border on all sides) must exactly match the
+        # canvas height, otherwise paste() silently clips it and the bottom
+        # border disappears (this was the main cause of the misalignment).
+        AVATAR_BOX = CANVAS_H
+        AVATAR_SIZE = AVATAR_BOX - 2 * BORDER
 
         avatar_img = bytes_to_image(avatar_bytes)
         banner_img = bytes_to_image(banner_bytes)
@@ -123,46 +152,19 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # Avatar with border
-        avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
-        bordered_avatar = Image.new("RGBA", (AVATAR_SIZE + 2 * BORDER, AVATAR_SIZE + 2 * BORDER), (255, 255, 255, 255))
+        # ----- Avatar with border (now guaranteed to fit the canvas) -----
+        avatar_img = resize_cover(avatar_img, AVATAR_SIZE, AVATAR_SIZE)
+        bordered_avatar = Image.new("RGBA", (AVATAR_BOX, AVATAR_BOX), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # Banner processing
-        b_w, b_h = banner_img.size
-        if b_w > 50 and b_h > 50:
-            banner_img = banner_img.rotate(3, resample=Image.BICUBIC, expand=True)
-            b_w, b_h = banner_img.size
-            crop_top, crop_bottom, crop_sides = 0.23, 0.32, 0.17
-            left, top = b_w * crop_sides, b_h * crop_top
-            right, bottom = b_w * (1 - crop_sides), b_h * (1 - crop_bottom)
-            banner_img = banner_img.crop((left, top, right, bottom))
+        # ----- Banner: clean cover-fit, no rotation/stretch artifacts -----
+        target_banner_w = CANVAS_W - AVATAR_BOX
+        banner_img = resize_cover(banner_img, target_banner_w, CANVAS_H)
 
-        target_banner_w = CANVAS_W - AVATAR_SIZE - 2 * BORDER
-        b_w, b_h = banner_img.size
-        if b_h > 0:
-            scale = CANVAS_H / b_h
-            new_banner_w = int(b_w * scale)
-            if new_banner_w < target_banner_w:
-                scale = target_banner_w / b_w
-                new_banner_h = int(b_h * scale)
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            else:
-                banner_img = banner_img.resize((new_banner_w, CANVAS_H), Image.LANCZOS)
-            b_w, b_h = banner_img.size
-            if b_w > target_banner_w:
-                left = (b_w - target_banner_w) // 2
-                right = left + target_banner_w
-                banner_img = banner_img.crop((left, 0, right, CANVAS_H))
-            else:
-                banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
-        else:
-            banner_img = Image.new("RGBA", (target_banner_w, CANVAS_H), (50, 50, 50))
-
-        # Combine
+        # ----- Combine -----
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
         combined.paste(bordered_avatar, (0, 0), bordered_avatar)
-        combined.paste(banner_img, (AVATAR_SIZE + 2 * BORDER, 0))
+        combined.paste(banner_img, (AVATAR_BOX, 0))
 
         draw = ImageDraw.Draw(combined)
 
@@ -171,7 +173,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         guild_size = 84
         level_size = 78
 
-        text_x = AVATAR_SIZE + 2 * BORDER + 58  # avatar box width + border + offset
+        text_x = AVATAR_BOX + 58  # avatar box width + offset
 
         # Draw nickname
         draw_mixed_text_with_shadow(draw, (text_x, 68), nickname, name_size, shadow_offset=(3, 3))
@@ -189,7 +191,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         # ----- Pin badge (lower left) -----
         if pin_img and pin_img.size != (100, 100):
             pin_size = 160
-            pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
+            pin_img = resize_cover(pin_img, pin_size, pin_size)
             combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
 
         img_io = io.BytesIO()
