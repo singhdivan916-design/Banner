@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+from scipy import ndimage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -135,51 +136,89 @@ def resize_cover(img, target_w, target_h):
     img = img.crop((left, top, left + target_w, top + target_h))
     return img
 
-def extract_banner_content(img):
+def crop_to_content(img, var_thresh=8.0, max_trim_frac=0.35):
     """
-    The raw banner PNGs from the CDN are a small tilted stripe-card artwork
-    sitting inside a much larger canvas of near-black padding, jagged edges,
-    and a bright gold gradient bar along the very bottom. This crops down to
-    just the actual card artwork so only the "banner part" ends up on the
-    final image (the caller then stretches this tight crop to fill the
-    banner box edge-to-edge, per spec).
+    Background-agnostic content crop. Works regardless of what color the
+    unwanted padding/frame is (black, purple, white, gradient, etc.) because
+    it measures relative difference from the image's own border, not an
+    absolute brightness value:
+
+    1. Sample the actual background color from the image's outer border ring.
+    2. Build a mask of pixels that differ meaningfully from that background.
+    3. Take the largest connected component of that mask (the real subject),
+       ignoring scattered glow/watermark speckles far from it.
+    4. Trim inward from each edge of that bbox while the edge row/col is
+       near-uniform (low variance) — strips flat decorative bars/borders
+       (e.g. a gold strip) that survived step 3 because they differ in
+       color from the background but aren't textured "content".
     """
     try:
         rgb = img.convert("RGB")
-        arr = np.array(rgb).astype(int)
-        maxc = arr.max(axis=2)
-        H, W = maxc.shape
-        if H < 4 or W < 4:
+        arr = np.array(rgb).astype(float)
+        H, W, _ = arr.shape
+        if H < 8 or W < 8:
             return img
 
-        # 1. Detect and strip the bright gold bar strip along the very bottom
-        rowmean = maxc.mean(axis=1)
-        gold_top = H
-        for y in range(H - 1, H // 2, -1):
-            if rowmean[y] > 150:
-                gold_top = y
-            elif gold_top < H:
-                break
-        work = maxc[:gold_top, :]
-        if work.size == 0:
+        ring = 3
+        border_pixels = np.concatenate([
+            arr[:ring, :, :].reshape(-1, 3),
+            arr[-ring:, :, :].reshape(-1, 3),
+            arr[:, :ring, :].reshape(-1, 3),
+            arr[:, -ring:, :].reshape(-1, 3),
+        ], axis=0)
+        bg_color = np.median(border_pixels, axis=0)
+        diff = np.sqrt(((arr - bg_color) ** 2).sum(axis=2))
+
+        thresh = max(40.0, diff.mean() + 0.5 * diff.std())
+        mask = diff > thresh
+
+        labeled, n = ndimage.label(mask, structure=np.ones((3, 3)))
+        if n == 0:
             return img
+        sizes = ndimage.sum(mask, labeled, range(1, n + 1))
+        comp_mask = labeled == (np.argmax(sizes) + 1)
 
-        # 2. Adaptive threshold to isolate the bright card art from dark margins
-        thresh = 130
-        mask = work > thresh
-        while mask.sum() < 0.10 * work.size and thresh > 50:
-            thresh -= 20
-            mask = work > thresh
-
-        ys, xs = np.where(mask)
+        ys, xs = np.where(comp_mask)
         if len(ys) == 0:
             return img
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
 
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        pad = 2
+        y0, x0 = max(0, y0 - pad), max(0, x0 - pad)
+        y1, x1 = min(H, y1 + pad), min(W, x1 + pad)
+
+        gray = arr.mean(axis=2)
+        max_trim_y = int((y1 - y0) * max_trim_frac)
+        max_trim_x = int((x1 - x0) * max_trim_frac)
+
+        trimmed = 0
+        while y1 - y0 > 4 and trimmed < max_trim_y:
+            if gray[y0, x0:x1].std() < var_thresh:
+                y0 += 1; trimmed += 1
+            else:
+                break
+        trimmed = 0
+        while y1 - y0 > 4 and trimmed < max_trim_y:
+            if gray[y1 - 1, x0:x1].std() < var_thresh:
+                y1 -= 1; trimmed += 1
+            else:
+                break
+        trimmed = 0
+        while x1 - x0 > 4 and trimmed < max_trim_x:
+            if gray[y0:y1, x0].std() < var_thresh:
+                x0 += 1; trimmed += 1
+            else:
+                break
+        trimmed = 0
+        while x1 - x0 > 4 and trimmed < max_trim_x:
+            if gray[y0:y1, x1 - 1].std() < var_thresh:
+                x1 -= 1; trimmed += 1
+            else:
+                break
+
         return img.crop((x0, y0, x1, y1))
     except Exception as e:
-        logger.warning(f"extract_banner_content failed, using full image: {e}")
+        logger.warning(f"crop_to_content failed, using full image: {e}")
         return img
 
 def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
@@ -200,17 +239,18 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # ----- Avatar: cover-crop (fills the box, no distortion even if the
-        # source isn't perfectly square) -----
+        # ----- Avatar: crop away any unwanted background/frame first (works
+        # for any background color), then cover-fit into its box -----
+        avatar_img = crop_to_content(avatar_img)
         avatar_img = resize_cover(avatar_img, AVATAR_SIZE, AVATAR_SIZE)
         bordered_avatar = Image.new("RGBA", (AVATAR_BOX, AVATAR_BOX), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner: crop out the dark padding/gold bar so only the actual
-        # card artwork remains, then stretch that tight crop left-to-right to
-        # fill the banner area edge-to-edge -----
+        # ----- Banner: crop out the unwanted padding/background (any color)
+        # so only the actual card artwork remains, then stretch that tight
+        # crop left-to-right to fill the banner area edge-to-edge -----
         target_banner_w = CANVAS_W - AVATAR_BOX
-        banner_img = extract_banner_content(banner_img)
+        banner_img = crop_to_content(banner_img)
         banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
