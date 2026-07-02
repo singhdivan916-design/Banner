@@ -152,14 +152,15 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         nickname = data.get("AccountName", "Not Found")
         guild_name = data.get("GuildName", "Not Found")
 
-        # ----- Avatar with border (now guaranteed to fit the canvas) -----
-        avatar_img = resize_cover(avatar_img, AVATAR_SIZE, AVATAR_SIZE)
+        # ----- Avatar with border (stretched to exactly fill its box, no gaps) -----
+        avatar_img = avatar_img.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
         bordered_avatar = Image.new("RGBA", (AVATAR_BOX, AVATAR_BOX), (255, 255, 255, 255))
         bordered_avatar.paste(avatar_img, (BORDER, BORDER), avatar_img)
 
-        # ----- Banner: clean cover-fit, no rotation/stretch artifacts -----
+        # ----- Banner: stretched to exactly fill its area so only the artwork
+        # shows, with none of the source PNG's background/padding color visible -----
         target_banner_w = CANVAS_W - AVATAR_BOX
-        banner_img = resize_cover(banner_img, target_banner_w, CANVAS_H)
+        banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
         combined = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
@@ -191,7 +192,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         # ----- Pin badge (lower left) -----
         if pin_img and pin_img.size != (100, 100):
             pin_size = 160
-            pin_img = resize_cover(pin_img, pin_size, pin_size)
+            pin_img = pin_img.resize((pin_size, pin_size), Image.LANCZOS)
             combined.paste(pin_img, (0, CANVAS_H - pin_size), pin_img)
 
         img_io = io.BytesIO()
