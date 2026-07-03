@@ -286,7 +286,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
         # so only the actual card artwork remains, then stretch that tight
         # crop left-to-right to fill the banner area edge-to-edge -----
         target_banner_w = CANVAS_W - AVATAR_BOX
-        banner_img = crop_to_content(banner_img, extra_zoom=0.04)
+        banner_img = crop_to_content(banner_img, extra_zoom=0.16)
         banner_img = banner_img.resize((target_banner_w, CANVAS_H), Image.LANCZOS)
 
         # ----- Combine -----
